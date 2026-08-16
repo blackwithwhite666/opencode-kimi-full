@@ -2,7 +2,12 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { afterEach, expect, test } from "bun:test"
-import { ensureFreshStoredAuth } from "../src/auth-refresh.ts"
+import {
+  ensureFreshStoredAuth,
+  refreshAuthWithLock,
+  REFRESH_LOCK_WAIT_MS,
+  RefreshLockTimeoutError,
+} from "../src/auth-refresh.ts"
 import { PROVIDER_ID } from "../src/constants.ts"
 import { installFetchMock } from "./_util/fetchMock.ts"
 
@@ -130,4 +135,84 @@ test("ensureFreshStoredAuth does not fail when cleanup cannot verify lock owners
   const auth = await ensureFreshStoredAuth()
   expect(auth.access).toBe("fresh")
   expect(mock.calls).toHaveLength(1)
+})
+
+function expiringAuth() {
+  return {
+    type: "oauth" as const,
+    access: "stale",
+    refresh: "refresh-1",
+    expires: Date.now() - 1_000,
+  }
+}
+
+async function withHeldRefreshLock(run: (lockDir: string) => Promise<void>) {
+  root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-kimi-auth-refresh-"))
+  previousXdgDataHome = process.env.XDG_DATA_HOME
+  process.env.XDG_DATA_HOME = root
+  const lockDir = refreshLockPath(root)
+  await fs.mkdir(lockDir, { recursive: true })
+  await fs.writeFile(path.join(lockDir, "owner.json"), JSON.stringify({ token: "other-process" }), "utf8")
+  await run(lockDir)
+}
+
+async function triggerRefreshLockTimeout<T>(run: () => Promise<T>) {
+  const realNow = Date.now()
+  let nowCalls = 0
+  const originalNow = Date.now
+  Date.now = () => {
+    nowCalls++
+    return nowCalls <= 3 ? realNow : realNow + REFRESH_LOCK_WAIT_MS + 1
+  }
+  try {
+    return await run()
+  } finally {
+    Date.now = originalNow
+  }
+}
+
+test("refreshAuthWithLock returns a fresh auth after a lock timeout", async () => {
+  expect(REFRESH_LOCK_WAIT_MS).toBe(120_000)
+  const latest = {
+    type: "oauth" as const,
+    access: "fresh",
+    refresh: "refresh-2",
+    expires: Date.now() + 10 * 60_000,
+  }
+
+  await withHeldRefreshLock(async () => {
+    const result = await triggerRefreshLockTimeout(() =>
+      refreshAuthWithLock(expiringAuth(), {
+        readLatest: async () => latest,
+        persist: async () => undefined,
+      }),
+    )
+    expect(result).toBe(latest)
+  })
+})
+
+test("refreshAuthWithLock propagates a lock timeout without fresh auth", async () => {
+  await withHeldRefreshLock(async () => {
+    const error = await triggerRefreshLockTimeout(() =>
+      refreshAuthWithLock(expiringAuth(), {
+        readLatest: async () => undefined,
+        persist: async () => undefined,
+      }).catch((caught: unknown) => caught),
+    )
+    expect(error).toBeInstanceOf(RefreshLockTimeoutError)
+    expect((error as RefreshLockTimeoutError).code).toBe("REFRESH_LOCK_TIMEOUT")
+  })
+})
+
+test("refreshAuthWithLock propagates a lock timeout when latest auth is still expiring", async () => {
+  const latest = expiringAuth()
+  await withHeldRefreshLock(async () => {
+    const error = await triggerRefreshLockTimeout(() =>
+      refreshAuthWithLock(expiringAuth(), {
+        readLatest: async () => latest,
+        persist: async () => undefined,
+      }).catch((caught: unknown) => caught),
+    )
+    expect(error).toBeInstanceOf(RefreshLockTimeoutError)
+  })
 })
