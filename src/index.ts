@@ -3,6 +3,7 @@ import { isAuthExpiring, refreshAuthWithLock } from "./auth-refresh.ts"
 import { isOAuthAuth, readAuth, type OAuthAuth } from "./auth-store.ts"
 import { API_BASE_URL, MODEL_ID, PROVIDER_ID } from "./constants.ts"
 import { kimiHeaders } from "./headers.ts"
+import { sanitizeMessages } from "./message-sanitizer.ts"
 import { type KimiModelInfo, listModels, pollDeviceToken, startDeviceAuth } from "./oauth.ts"
 
 // IMPORTANT: this module must have exactly ONE export — the default
@@ -567,17 +568,29 @@ const plugin: Plugin = async ({ client }) => {
                         .text()
                         .catch(() => undefined)
                     : undefined
-              if (((targetModel && targetModel !== MODEL_ID) || hasKimiBodyFields(kimiBodyFields)) && originalBody) {
+              if (originalBody !== undefined) {
                 try {
                   const parsed = JSON.parse(originalBody)
                   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                    let bodyChanged = false
                     if (targetModel && targetModel !== MODEL_ID && parsed.model === MODEL_ID) {
                       parsed.model = targetModel
+                      bodyChanged = true
                     }
                     if (hasKimiBodyFields(kimiBodyFields)) {
                       applyKimiBodyFields(parsed as Record<string, unknown>, kimiBodyFields)
+                      bodyChanged = true
                     }
-                    newInit = { ...init, body: JSON.stringify(parsed) }
+                    if (Array.isArray(parsed.messages)) {
+                      const sanitizedMessages = sanitizeMessages(parsed.messages)
+                      if (sanitizedMessages !== parsed.messages) {
+                        parsed.messages = sanitizedMessages
+                        bodyChanged = true
+                      }
+                    }
+                    if (bodyChanged) {
+                      newInit = { ...init, body: JSON.stringify(parsed) }
+                    }
                   }
                 } catch {
                   /* non-JSON body, e.g. multipart — leave alone */

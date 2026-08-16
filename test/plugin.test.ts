@@ -572,6 +572,30 @@ test("auth.loader: injects default thinking via private headers and strips them 
   })
 })
 
+test("auth.loader: drops empty assistant messages but keeps tool calls", async () => {
+  mock = installFetchMock(() => ({ body: { ok: true } }))
+  const { fetch: f } = await getLoaderFetch(
+    async () => ({ ...validAuth(), model_id: MODEL_ID }) as unknown as ReturnType<typeof validAuth>,
+  )
+  await f("https://api.kimi.com/coding/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: MODEL_ID,
+      messages: [
+        { role: "assistant", content: "" },
+        { role: "assistant", content: "", tool_calls: [{ id: "call-1" }] },
+        { role: "user", content: "hello" },
+      ],
+    }),
+  })
+
+  expect(JSON.parse(mock.calls[0]!.body as string).messages).toEqual([
+    { role: "assistant", content: "", tool_calls: [{ id: "call-1" }] },
+    { role: "user", content: "hello" },
+  ])
+})
+
 test("auth.loader: injects selected reasoning_effort from private headers into the wire body", async () => {
   const { hooks } = await getHooks()
   const { output: headerOutput } = await callHeaders(hooks["chat.headers"]!, {

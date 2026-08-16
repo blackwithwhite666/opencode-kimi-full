@@ -11,11 +11,20 @@ import {
 } from "./auth-store.ts"
 import { refreshToken } from "./oauth.ts"
 
-const REFRESH_LOCK_WAIT_MS = 15_000
+export const REFRESH_LOCK_WAIT_MS = 120_000
 const REFRESH_LOCK_POLL_MS = 100
 const REFRESH_LOCK_STALE_MS = 120_000
 const REFRESH_LOCK_HEARTBEAT_MS = 30_000
 const REFRESH_LOCK_OWNER_FILE = "owner.json"
+
+export class RefreshLockTimeoutError extends Error {
+  readonly code = "REFRESH_LOCK_TIMEOUT"
+
+  constructor() {
+    super("kimi oauth: timed out waiting for the auth refresh lock")
+    this.name = "RefreshLockTimeoutError"
+  }
+}
 
 type RefreshOptions = {
   force?: boolean
@@ -121,7 +130,7 @@ async function withRefreshLock<T>(work: () => Promise<T>) {
       if (code !== "EEXIST") throw error
       if (await removeStaleLock(lockDir, ownerFile)) continue
       if (Date.now() >= deadline) {
-        throw new Error("kimi oauth: timed out waiting for the auth refresh lock")
+        throw new RefreshLockTimeoutError()
       }
       await sleep(REFRESH_LOCK_POLL_MS)
     }
@@ -144,28 +153,39 @@ async function withRefreshLock<T>(work: () => Promise<T>) {
 
 export async function refreshAuthWithLock(auth: OAuthAuth, options: RefreshOptions) {
   const force = options.force ?? false
-  return withRefreshLock(async () => {
-    const latest = await options.readLatest?.()
-    const current = latest ?? auth
-    if (latest && !sameAuth(latest, auth) && !force && !isAuthExpiring(latest)) return latest
-    if (!force && !isAuthExpiring(current)) return current
+  try {
+    return await withRefreshLock(async () => {
+      const latest = await options.readLatest?.()
+      const current = latest ?? auth
+      if (latest && !sameAuth(latest, auth) && !force && !isAuthExpiring(latest)) return latest
+      if (!force && !isAuthExpiring(current)) return current
 
-    try {
-      const tokens = await refreshToken(current.refresh)
-      const next: OAuthAuth = {
-        type: "oauth",
-        refresh: tokens.refresh_token,
-        access: tokens.access_token,
-        expires: Date.now() + tokens.expires_in * 1000,
+      try {
+        const tokens = await refreshToken(current.refresh)
+        const next: OAuthAuth = {
+          type: "oauth",
+          refresh: tokens.refresh_token,
+          access: tokens.access_token,
+          expires: Date.now() + tokens.expires_in * 1000,
+        }
+        await options.persist(next)
+        return next
+      } catch (error) {
+        const newest = await options.readLatest?.()
+        if (newest && !sameAuth(newest, current)) return newest
+        throw withInvalidGrantHint(error)
       }
-      await options.persist(next)
-      return next
-    } catch (error) {
-      const newest = await options.readLatest?.()
-      if (newest && !sameAuth(newest, current)) return newest
-      throw withInvalidGrantHint(error)
+    })
+  } catch (error) {
+    if (!(error instanceof RefreshLockTimeoutError)) throw error
+    try {
+      const latest = await options.readLatest?.()
+      if (latest && !isAuthExpiring(latest)) return latest
+    } catch {
+      // Preserve the distinguishable timeout if the fallback read fails.
     }
-  })
+    throw error
+  }
 }
 
 export async function ensureFreshStoredAuth() {
